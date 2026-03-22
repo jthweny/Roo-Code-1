@@ -1700,6 +1700,51 @@ export const webviewMessageHandler = async (
 				}
 			}
 			break
+		case "enhancePersonalityTrait":
+			if (message.text) {
+				try {
+					const state = await provider.getState()
+
+					const {
+						apiConfiguration,
+						listApiConfigMeta = [],
+						enhancementApiConfigId,
+						personalityTraitEnhancerPrompt,
+					} = state
+
+					// Determine which API configuration to use
+					let configToUse = apiConfiguration
+
+					if (enhancementApiConfigId && listApiConfigMeta.find(({ id }) => id === enhancementApiConfigId)) {
+						const { name: _, ...providerSettings } = await provider.providerSettingsManager.getProfile({
+							id: enhancementApiConfigId,
+						})
+
+						if (providerSettings.apiProvider) {
+							configToUse = providerSettings
+						}
+					}
+
+					// Use custom enhancer prompt or default
+					const { DEFAULT_PERSONALITY_TRAIT_ENHANCER_PROMPT } = await import(
+						"../../shared/personality-traits"
+					)
+					const metaPrompt = (personalityTraitEnhancerPrompt || DEFAULT_PERSONALITY_TRAIT_ENHANCER_PROMPT)
+						.replace("{input}", message.text)
+
+					const { singleCompletionHandler } = await import("../../utils/single-completion-handler")
+					const enhancedText = await singleCompletionHandler(configToUse, metaPrompt)
+
+					await provider.postMessageToWebview({ type: "enhancedPersonalityTrait", text: enhancedText })
+				} catch (error) {
+					provider.log(
+						`Error enhancing personality trait: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`,
+					)
+					vscode.window.showErrorMessage("Failed to enhance personality trait. Please try again.")
+					await provider.postMessageToWebview({ type: "enhancedPersonalityTrait" })
+				}
+			}
+			break
 		case "getSystemPrompt":
 			try {
 				const systemPrompt = await generateSystemPrompt(provider, message)
@@ -3645,6 +3690,139 @@ export const webviewMessageHandler = async (
 				provider.log(`Error opening folder picker: ${errorMessage}`)
 			}
 
+			break
+		}
+
+		case "toggleMemoryLearning": {
+			const currentMemoryState = getGlobalState("memoryLearningEnabled") ?? false
+			const newMemoryState = !currentMemoryState
+			await updateGlobalState("memoryLearningEnabled", newMemoryState)
+			const orchestrator = provider.getMemoryOrchestrator()
+			if (orchestrator) {
+				orchestrator.setEnabled(newMemoryState)
+			}
+			await provider.postMessageToWebview({
+				type: "memoryLearningState",
+				text: String(newMemoryState),
+			})
+			break
+		}
+
+		case "updateMemorySettings": {
+			if (message.text) {
+				try {
+					const memorySettings = JSON.parse(message.text)
+					if (memorySettings.memoryApiConfigId !== undefined) {
+						await updateGlobalState("memoryApiConfigId", memorySettings.memoryApiConfigId)
+					}
+					if (memorySettings.memoryAnalysisFrequency !== undefined) {
+						await updateGlobalState("memoryAnalysisFrequency", memorySettings.memoryAnalysisFrequency)
+					}
+					if (memorySettings.memoryLearningDefaultEnabled !== undefined) {
+						await updateGlobalState(
+							"memoryLearningDefaultEnabled",
+							memorySettings.memoryLearningDefaultEnabled,
+						)
+					}
+				} catch (e) {
+					console.error("[Memory] Failed to parse settings:", e)
+				}
+			}
+			break
+		}
+
+		case "startMemorySync": {
+			const { taskIds } = JSON.parse(message.text || "{}") as { taskIds: string[] }
+			const orchestrator = provider.getMemoryOrchestrator()
+			if (!orchestrator) break
+
+			// Guard against concurrent syncs
+			if (orchestrator.isSyncInProgress()) {
+				await provider.postMessageToWebview({
+					type: "memorySyncAlreadyRunning",
+				})
+				break
+			}
+
+			const memoryConfigId = getGlobalState("memoryApiConfigId")
+			if (!memoryConfigId) break
+
+			try {
+				const { name: _, ...memSettings } = await provider.providerSettingsManager.getProfile({
+					id: memoryConfigId,
+				})
+
+				const globalStoragePath = provider.contextProxy.globalStorageUri.fsPath
+
+				orchestrator
+					.batchAnalyzeHistory(
+						taskIds,
+						globalStoragePath,
+						memSettings,
+						(completed, total) => {
+							provider.postMessageToWebview({
+								type: "memorySyncProgress",
+								text: JSON.stringify({ completed, total }),
+							})
+						},
+					)
+					.then((result) => {
+						provider.postMessageToWebview({
+							type: "memorySyncComplete",
+							text: JSON.stringify(result),
+						})
+					})
+					.catch(() => {
+						provider.postMessageToWebview({
+							type: "memorySyncComplete",
+							text: JSON.stringify({
+								totalAnalyzed: 0,
+								entriesCreated: 0,
+								entriesReinforced: 0,
+							}),
+						})
+					})
+			} catch {
+				// Profile not found
+			}
+			break
+		}
+
+		case "clearMemory": {
+			const orchestrator = provider.getMemoryOrchestrator()
+			if (orchestrator) {
+				orchestrator.clearAllMemory()
+				await provider.postMessageToWebview({ type: "memoryCleared" })
+			}
+			break
+		}
+
+		case "getMemoryStatus": {
+			const orch = provider.getMemoryOrchestrator()
+			if (orch) {
+				const store = orch.getStore()
+				const count = store.getEntryCount()
+				const lastLog = store.getLastAnalysisTimestamp()
+				await provider.postMessageToWebview({
+					type: "memoryStatus",
+					text: JSON.stringify({ entryCount: count, lastAnalyzedAt: lastLog }),
+				})
+			} else {
+				await provider.postMessageToWebview({
+					type: "memoryStatus",
+					text: JSON.stringify({ entryCount: 0, lastAnalyzedAt: null }),
+				})
+			}
+			break
+		}
+
+		case "getMemorySyncStatus": {
+			const orchestrator = provider.getMemoryOrchestrator()
+			const status = orchestrator?.getSyncStatus() ?? { inProgress: false, completed: 0, total: 0 }
+			await provider.postMessageToWebview({
+				type: "memorySyncStatus",
+				text: JSON.stringify(status),
+			})
 			break
 		}
 
